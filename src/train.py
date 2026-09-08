@@ -407,7 +407,7 @@ def train_one_epoch(
     epoch_output_sum = torch.zeros((), device=device, dtype=torch.float32)
     epoch_count = 0
 
-    def maybe_log_window(force: bool = False) -> None:
+    def maybe_log_window(force: bool = True) -> None:
         nonlocal window_count
         should_log = False
         if train_log_mode == "step":

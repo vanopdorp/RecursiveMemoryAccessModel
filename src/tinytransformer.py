@@ -550,6 +550,64 @@ class TransformerBlock(nn.Module):
             return hidden_states, present_key_value
 
 
+class InternalTransformerMemory(nn.Module):
+    def __init__(self, hidden_dim, num_slots=64, slot_dim=64):
+        super().__init__()
+
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.init_slots = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.01)
+
+        self.write_gate = nn.Linear(hidden_dim, num_slots)
+        self.erase_gate = nn.Linear(hidden_dim, num_slots)
+        self.importance = nn.Linear(hidden_dim, num_slots)
+        self.slot_select = nn.Linear(hidden_dim, num_slots)
+        self.write_value = nn.Linear(hidden_dim, slot_dim)
+
+        self.read_key = nn.Linear(hidden_dim, slot_dim)
+
+        self.state_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+
+        self.norm = nn.LayerNorm(slot_dim)
+
+    def _write(self, h_t, slots):
+        w_gate = torch.sigmoid(self.write_gate(h_t))
+        e_gate = torch.sigmoid(self.erase_gate(h_t))
+        imp = torch.sigmoid(self.importance(h_t))
+        sel = torch.softmax(self.slot_select(h_t), dim=-1)
+        w_val = self.write_value(h_t)
+
+        erase = (1 - e_gate).unsqueeze(-1)
+        write = (w_gate * imp * sel).unsqueeze(-1)
+
+        slots = slots * erase + write * w_val.unsqueeze(1)
+        return self.norm(slots)
+
+    def _read(self, h_t, slots):
+        r_key = self.read_key(h_t)
+        scores = torch.einsum("bd,bNd->bN", r_key, slots)
+        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)
+        read_vec = (weights * slots).sum(dim=1)
+        return read_vec
+
+    def forward(self, hidden_states):
+
+        b = hidden_states.size(0)
+
+        h0 = torch.zeros(1, b, hidden_states.size(-1), device=hidden_states.device)
+        _, h_last = self.state_gru(hidden_states, h0)
+        h_last = h_last.squeeze(0)
+
+        slots = self.init_slots.unsqueeze(0).expand(b, -1, -1)
+
+        slots = self._write(h_last, slots)
+
+        read_vec = self._read(h_last, slots)
+
+        hidden_states[:, -1, :] += read_vec
+
+        return hidden_states
+
 class TinyTransformer(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
@@ -571,6 +629,12 @@ class TinyTransformer(nn.Module):
         # Decode block-mask cache keyed by (device_type, device_index, kv_len, block_idx).
         self._decode_block_mask_cache: Dict[Tuple[str, int, int, int], object] = {}
         self._decode_block_size = 128
+
+        self.internal_memory = InternalTransformerMemory(
+            hidden_dim=config.d_model,
+            num_slots=64,
+            slot_dim=64,
+        )
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -949,6 +1013,7 @@ class TinyTransformer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen_resolved,
             )
+        hidden_states = self.internal_memory(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
