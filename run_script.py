@@ -61,8 +61,8 @@ args_dict = {
     
     # Hyperparameters
     "epochs": preset["epochs"], 
-    "batch_size": 32,
-    "gradient_accumulation_steps": 1,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 2,
     "do_validate": False,
     "val_batch_size": 70,
 
