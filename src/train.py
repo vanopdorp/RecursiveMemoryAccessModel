@@ -34,7 +34,7 @@ def _zeropower_via_newtonschulz5(G, steps=5):
     """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G."""
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.float16()
     if G.size(-2) > G.size(-1):
         X = X.mT
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
@@ -480,7 +480,7 @@ def train_one_epoch(
                 accum_target = accum_steps
 
         with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
         ):
             outputs = model(
                 input_ids,
@@ -618,7 +618,7 @@ def validate_one_epoch(
             continue
 
         with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
         ):
             outputs = model(
                 input_ids,
@@ -692,7 +692,7 @@ def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
         return False, "NorMuon requires CUDA."
     bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
     if callable(bf16_supported) and not bf16_supported():
-        return False, "NorMuon requires CUDA bfloat16 support"
+        return False, "NorMuon requires CUDA float16 support"
     return True, ""
 
 

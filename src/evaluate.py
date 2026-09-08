@@ -185,7 +185,7 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
+    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.float16)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
@@ -201,8 +201,8 @@ def batched_greedy_generate(
     past_key_values = []
     for k, v in prompt_kvs:
         B, H, L, D = k.shape
-        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
-        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.float16, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.float16, device=device)
         k_buf[:, :, :L, :] = k
         v_buf[:, :, :L, :] = v
         past_key_values.append((k_buf, v_buf))
@@ -474,8 +474,8 @@ def run_split_inference(
     augmentor: Optional[Augmentor] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
     model.eval()
-    if next(model.parameters()).dtype != torch.bfloat16:
-        model.to(dtype=torch.bfloat16)
+    if next(model.parameters()).dtype != torch.float16:
+        model.to(dtype=torch.float16)
 
     examples = _gather_examples_for_split(
         dataset, split=split, task_ids=task_ids, pair_index=pair_index,
