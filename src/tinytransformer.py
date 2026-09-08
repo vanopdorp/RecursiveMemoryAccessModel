@@ -6,11 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_attn import flash_attn_varlen_qkvpacked_func
-except ImportError:  # pragma: no cover - flash-attn optional at import time
-    flash_attn_varlen_qkvpacked_func = None
-
-try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 except ImportError:  # pragma: no cover - flex-attention optional at import time
     create_block_mask = None
@@ -70,7 +65,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim**-0.5
-        self._has_flash_attn_varlen = flash_attn_varlen_qkvpacked_func is not None
         self._has_flex_attention = flex_attention is not None
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
@@ -215,36 +209,6 @@ class MultiHeadSelfAttention(nn.Module):
             scale=self.scale,
         )
 
-    def _apply_varlen_flash_attention(
-        self,
-        qkv: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        dropout_p: float,
-        is_causal: bool,
-    ) -> torch.Tensor:
-        if not self._has_flash_attn_varlen:
-            raise RuntimeError(
-                "flash-attn varlen attention requested, but flash-attn is not installed."
-            )
-        if qkv.device.type != "cuda":
-            raise RuntimeError("flash-attn varlen kernels require CUDA tensors.")
-        if qkv.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(
-                "flash-attn varlen expects fp16/bf16 qkv tensors. "
-                "Run this path under CUDA autocast."
-            )
-        if cu_seqlens.device != qkv.device or cu_seqlens.dtype != torch.int32:
-            cu_seqlens = cu_seqlens.to(device=qkv.device, dtype=torch.int32)
-        return flash_attn_varlen_qkvpacked_func(
-            qkv,
-            cu_seqlens,
-            int(max_seqlen),
-            dropout_p=dropout_p,
-            softmax_scale=None,
-            causal=is_causal,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -253,53 +217,9 @@ class MultiHeadSelfAttention(nn.Module):
         pos_xyz: Optional[torch.Tensor] = None,
         sdpa_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        if hidden_states.dim() == 2:
-            if cu_seqlens is None:
-                raise ValueError(
-                    "cu_seqlens is required for packed varlen attention inputs."
-                )
-            if max_seqlen is None:
-                raise ValueError(
-                    "max_seqlen is required for packed varlen attention inputs."
-                )
-            if attention_mask is not None or causal_mask is not None or sdpa_mask is not None:
-                raise ValueError(
-                    "Packed varlen attention does not support explicit attention masks."
-                )
-
-            total_tokens, dim = hidden_states.shape
-            qkv = self.qkv_proj(hidden_states)
-            qkv = qkv.view(total_tokens, 3, self.n_heads, self.head_dim)
-            queries, keys, values = qkv.unbind(1)
-            qkv_dtype = queries.dtype
-
-            if pos_xyz is not None:
-                if pos_xyz.dim() != 2 or pos_xyz.size(0) != total_tokens:
-                    raise ValueError(
-                        "Packed pos_xyz must have shape [total_tokens, 3]."
-                    )
-                q_f32 = queries.transpose(0, 1).unsqueeze(0).float()
-                k_f32 = keys.transpose(0, 1).unsqueeze(0).float()
-                q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz.unsqueeze(0))
-                queries = q_f32.squeeze(0).transpose(0, 1).to(dtype=qkv_dtype)
-                keys = k_f32.squeeze(0).transpose(0, 1).to(dtype=qkv_dtype)
-
-            qkv_packed = torch.stack((queries, keys, values), dim=1).contiguous()
-            attn_output = self._apply_varlen_flash_attention(
-                qkv=qkv_packed,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=is_causal,
-            )
-            attn_output = attn_output.contiguous().view(total_tokens, dim)
-            return self.out_proj(attn_output)
-
         if hidden_states.dim() != 3:
-            raise ValueError("hidden_states must be rank-2 or rank-3.")
+            raise ValueError("hidden_states must be rank-3.")
         batch_size, seq_len, dim = hidden_states.shape
 
         qkv = self.qkv_proj(hidden_states)
@@ -462,8 +382,6 @@ class TransformerBlock(nn.Module):
         pos_xyz: Optional[torch.Tensor],
         sdpa_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
@@ -473,8 +391,6 @@ class TransformerBlock(nn.Module):
             pos_xyz=pos_xyz,
             sdpa_mask=sdpa_mask,
             is_causal=is_causal,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
         )
         hidden_states = hidden_states + attn_output
 
@@ -929,6 +845,12 @@ class TinyTransformer(nn.Module):
         cu_seqlens: Optional[torch.Tensor],
         max_seqlen: Optional[int],
     ) -> dict:
+        """Handle packed (varlen) batches without flash-attn.
+
+        flash-attn has been removed, so there is no dedicated packed-kernel
+        path anymore. We un-pack the concatenated sequences into right-padded
+        batches and delegate to `_forward_padded`, which runs standard SDPA.
+        """
         if cu_seqlens is None:
             raise ValueError("cu_seqlens is required for packed varlen inputs.")
         if positions_3d is None:
@@ -968,104 +890,47 @@ class TinyTransformer(nn.Module):
                 f"Sequence length {max_seqlen_resolved} exceeds model capacity ({self.config.max_seq_len})."
             )
 
-        if sep_indices is not None:
-            if sep_indices.device != device or sep_indices.dtype != torch.long:
-                sep_indices = sep_indices.to(device=device, dtype=torch.long)
-            if sep_indices.dim() != 1 or sep_indices.size(0) != batch_size:
-                raise ValueError("sep_indices must have shape [batch_size].")
-
+        # Un-pack the concatenated sequences into right-padded [B, S] tensors.
+        padded_len = max_seqlen_resolved
+        padded_input = torch.zeros(
+            (batch_size, padded_len), dtype=input_ids.dtype, device=device
+        )
+        padded_mask = torch.zeros(
+            (batch_size, padded_len), dtype=torch.bool, device=device
+        )
+        padded_positions = torch.zeros(
+            (batch_size, padded_len, 3), dtype=positions_3d.dtype, device=device
+        )
         if targets is not None:
-            if targets.dim() != 1 or targets.size(0) != total_tokens:
-                raise ValueError("targets must have shape [total_tokens] for varlen inputs.")
-            if targets.device != device or targets.dtype != torch.long:
-                targets = targets.to(device=device, dtype=torch.long)
-        else:
-            targets = torch.roll(input_ids, shifts=-1).clone()
-            sequence_ends = cu_seqlens[1:].to(dtype=torch.long) - 1
-            targets[sequence_ends] = IGNORE_INDEX
-
-        example_ids = example_ids.to(device=device, dtype=torch.long)
-        dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
-        token_embeds = self.token_embedding(input_ids)
-
-        # Build per-sequence conditioning once, then broadcast to packed tokens.
-        sequence_embeds = self.example_embedding(example_ids) + self.dihedral_embedding(
-            dihedral_ids
-        )
-        token_sequence_embeds = torch.repeat_interleave(
-            sequence_embeds,
-            seq_lengths,
-            dim=0,
-        )
-        hidden_states = token_embeds + token_sequence_embeds
-        hidden_states = self.dropout(hidden_states)
-
-        pos_xyz = positions_3d.to(device=device, dtype=torch.long)
-
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                attention_mask=None,
-                causal_mask=None,
-                pos_xyz=pos_xyz,
-                sdpa_mask=None,
-                is_causal=True,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen_resolved,
+            padded_targets = torch.full(
+                (batch_size, padded_len),
+                IGNORE_INDEX,
+                dtype=targets.dtype,
+                device=device,
             )
-        hidden_states = self.internal_memory(hidden_states)
-
-        hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-
-        raw_losses = F.cross_entropy(
-            logits,
-            targets,
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-        )
-        valid_mask = targets != IGNORE_INDEX
-        total_valid = valid_mask.sum()
-        loss = raw_losses.sum() / total_valid.clamp(min=1)
-
-        seq_ids = torch.repeat_interleave(
-            torch.arange(batch_size, device=device, dtype=torch.long),
-            seq_lengths,
-        )
-        local_positions = torch.arange(total_tokens, device=device, dtype=torch.long)
-        local_positions = local_positions - torch.repeat_interleave(
-            cu_seqlens[:-1].to(dtype=torch.long),
-            seq_lengths,
-        )
-
-        if sep_indices is not None:
-            is_output_phase = local_positions >= sep_indices[seq_ids]
         else:
-            is_output_phase = torch.zeros_like(valid_mask)
-            is_sep = input_ids == IO_SEPARATOR_TOKEN_ID
-            for seq_idx in range(batch_size):
-                start = int(cu_seqlens[seq_idx].item())
-                end = int(cu_seqlens[seq_idx + 1].item())
-                is_output_phase[start:end] = is_sep[start:end].cumsum(dim=0) >= 1
+            padded_targets = None
 
-        valid_output = valid_mask & is_output_phase
-        num_output_tokens = valid_output.sum()
+        for seq_idx in range(batch_size):
+            start = int(cu_seqlens[seq_idx].item())
+            end = int(cu_seqlens[seq_idx + 1].item())
+            length = end - start
+            padded_input[seq_idx, :length] = input_ids[start:end]
+            padded_mask[seq_idx, :length] = True
+            padded_positions[seq_idx, :length] = positions_3d[start:end]
+            if padded_targets is not None:
+                padded_targets[seq_idx, :length] = targets[start:end]
 
-        input_loss = None
-        if compute_input_loss:
-            valid_input = valid_mask & (~is_output_phase)
-            input_loss = (raw_losses * valid_input).sum() / valid_input.sum().clamp(
-                min=1
-            )
-        output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(min=1)
-
-        return {
-            "logits": logits,
-            "loss": loss,
-            "input_loss": input_loss,
-            "output_loss": output_loss,
-            "num_output_tokens": num_output_tokens,
-        }
+        return self._forward_padded(
+            input_ids=padded_input,
+            example_ids=example_ids,
+            dihedral_ids=dihedral_ids,
+            attention_mask=padded_mask,
+            sep_indices=sep_indices,
+            compute_input_loss=compute_input_loss,
+            targets=padded_targets,
+            positions_3d=padded_positions,
+        )
 
     def forward_generate(
         self,
