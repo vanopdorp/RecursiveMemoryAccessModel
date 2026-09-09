@@ -477,6 +477,7 @@ def run_split_inference(
     if next(model.parameters()).dtype != torch.float16:
         model.to(dtype=torch.float16)
 
+    t_start = perf_counter()
     examples = _gather_examples_for_split(
         dataset, split=split, task_ids=task_ids, pair_index=pair_index,
     )
@@ -549,7 +550,17 @@ def run_split_inference(
             temperature=temperature, top_k=top_k,
         )
 
-        print(f"[{split}] Finished batch {start // batch_size + 1} / {(len(work_items) + batch_size - 1) // batch_size}")
+        batch_index = start // batch_size + 1
+        total_batches = (len(work_items) + batch_size - 1) // batch_size
+        elapsed = perf_counter() - t_start
+        elapsed_per_batch = elapsed / batch_index
+        remaining_batches = total_batches - batch_index
+        eta_seconds = elapsed_per_batch * remaining_batches
+        print(
+            f"[{split}] Finished batch {batch_index} / {total_batches} "
+            f"(elapsed {elapsed / 60:.1f}m, ETA {eta_seconds / 60:.1f}m)",
+            flush=True,
+        )
 
         if augmentor is None:
             all_results.extend(batch_results)
