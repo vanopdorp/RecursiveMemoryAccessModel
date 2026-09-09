@@ -3,3 +3,8 @@ __pycache__
 .DS_Store
 misc/
 new_dataset_scripts/
+
+# Large training checkpoints - never commit/push these
+runs/
+tiny.pt
+*.epoch*.pt
