@@ -26,10 +26,10 @@ PRESETS = {
         "inference_epoch": 90,
     },
     "medium": {
-        "epochs": 240,
-        "max_augments": 80,
-        "checkpoint_epochs": (),
-        "inference_epoch": 240,
+        "epochs": 650,
+        "max_augments": 300,
+        "checkpoint_epochs": tuple(range(10, 241, 10)),,
+        "inference_epoch": 648,
     },
     "high": {
         "epochs": 650,
