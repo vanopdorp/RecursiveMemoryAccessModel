@@ -132,7 +132,7 @@ def build_model_and_data(
     use_length_bucketing = bool(is_eval or getattr(args, "eval_only", False))
     dataloader = create_dataloader(
         dataset=dataset,
-        batch_size=args.batch_size,
+        batch_size=16,
         shuffle=not getattr(args, "eval_only", False),
         augment_selector=collate_augment_selector,
         use_length_bucketing=use_length_bucketing,
