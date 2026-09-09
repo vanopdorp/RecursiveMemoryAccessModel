@@ -28,7 +28,7 @@ PRESETS = {
     "medium": {
         "epochs": 650,
         "max_augments": 300,
-        "checkpoint_epochs": tuple(range(10, 241, 10)),,
+        "checkpoint_epochs": tuple(range(10, 241, 10)),
         "inference_epoch": 648,
     },
     "high": {
